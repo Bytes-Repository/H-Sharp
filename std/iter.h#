@@ -190,7 +190,10 @@ pub fn unique(arr: [any]) -> [any] is
     for x in arr is
         let mut found: bool = false
         for s in seen is
-            if s == x is found = true; break end
+            if s == x is
+                found = true
+                break
+            end
         end
         if !found is
             seen.push(x)
