@@ -703,10 +703,16 @@ BuiltinSpec {
 BuiltinSpec {
     names: &["__builtin_str_split_whitespace"],
     params: || vec![HType::Str],
-    ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Split on any run of whitespace. Interpreter only — AOT's string ops don't cover this yet.",
+    // [FIXED] Was `HType::Str` — this returns a `[string]` array of
+    // tokens, not a single string; left mismatched from when this was
+    // Interpreter-only (presumably not strictly enforced there). Now
+    // that it's also on Llvm and really typechecked against a call
+    // site's declared return type, the wrong element type would fail
+    // every real caller.
+    ret: || HType::Array(Box::new(HType::Str)),
+    c_symbol: Some("hsh_str_split_whitespace"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Split on any run of whitespace. Implemented on both backends — see core.c's hsh_str_split_whitespace.",
 },
 BuiltinSpec {
     names: &["__builtin_str_replace_all"],
@@ -1112,9 +1118,9 @@ BuiltinSpec {
     names: &["__builtin_date_format"],
     params: || vec![HType::Int, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "strftime-lite formatting (%Y %m %d %H %M %S). Interpreter only.",
+    c_symbol: Some("hsh_date_format"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "strftime-lite formatting (%Y %m %d %H %M %S). Implemented on both backends — Llvm's is a thin real-strftime wrapper (see core.c), a strict superset of the interpreter's own hand-rolled subset for any format string that only uses those codes.",
 },
 BuiltinSpec {
     names: &["__builtin_date_parse"],
@@ -1789,11 +1795,15 @@ BuiltinSpec {
 },
 BuiltinSpec {
     names: &["__builtin_sort_strings"],
-    params: || vec![HType::Str],
-    ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Sort a [string] array. Interpreter only.",
+    // [FIXED] `params`/`ret` were both `HType::Str` — this takes and
+    // returns a `[string]` array, not a single string (same class of
+    // mistyped-while-Interpreter-only spec as `str_split_whitespace`
+    // above, now that this is really typechecked on Llvm too).
+    params: || vec![HType::Array(Box::new(HType::Str))],
+    ret: || HType::Array(Box::new(HType::Str)),
+    c_symbol: Some("hsh_sort_strings"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Sort a [string] array. Implemented on both backends — see core.c's hsh_sort_strings.",
 },
 BuiltinSpec {
     names: &["__builtin_test_fail"],
@@ -1974,6 +1984,12 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         "env_get"          => "env_get",
         "env_set"          => "env_set",
         "env_args"         => "env_args",
+        // date::format / strings::sort / strings::split_whitespace —
+        // added this session (core.c + builtins.rs + codegen.rs's
+        // `call_fn`, all under these exact bare names).
+        "date_format"           => "date_format",
+        "sort_strings"          => "sort_strings",
+        "str_split_whitespace"  => "str_split_whitespace",
         "fs_read"          => "fs_read",
         "fs_write"         => "fs_write",
         "fs_exists"        => "fs_exists",
