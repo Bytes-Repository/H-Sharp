@@ -125,6 +125,22 @@ impl LangFeature {
 /// Walk `module` and return a diagnostic for every AST node using a feature
 /// unsupported on `backend`. Also checks every `Expr::Call`/`Expr::Ident`
 /// against `builtins_registry::supported_on`.
+///
+/// [REVERTED] This briefly gated checking to only functions reachable from
+/// `main` (via `reachability.rs`, to stop an unused function elsewhere in
+/// an imported std file from failing a build that never calls it — see
+/// that file's module doc comment for the motivating case). Reverted: the
+/// reachability walker had a real bug (missed a call reached only via a
+/// `match` arm) that would have made this pass silently skip checking a
+/// function that codegen still unconditionally compiles (codegen's
+/// matching use of the same pass was reverted for the same reason, in
+/// `codegen.rs`) — meaning a genuinely unsupported builtin in that
+/// wrongly-skipped function would now fail with a raw, unexplained
+/// codegen-time error instead of this pass's clear, well-formatted
+/// diagnostic. Back to checking every function unconditionally, exactly
+/// as before either change: noisier for the unused-std-function case, but
+/// never wrong. `reachability.rs` is left in the tree, unused, for a
+/// future attempt made with real test coverage.
 pub fn check_module_features(module: &Module, backend: Backend) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     // Needed by the `StructByValueFfi` check below (`check_extern_block`) —
@@ -152,7 +168,12 @@ fn check_item(item: &Item, backend: Backend, structs: &std::collections::HashMap
             }
             check_block(&f.body, backend, structs, out);
         }
-        Item::ImplBlock(imp) => for m in &imp.methods { check_item(&Item::FnDef(m.clone()), backend, structs, out); },
+        Item::ImplBlock(imp) => for m in &imp.methods {
+            if m.is_async && !LangFeature::AsyncFn.supported_on(backend) {
+                push(out, LangFeature::AsyncFn, backend, m.span.clone());
+            }
+            check_block(&m.body, backend, structs, out);
+        },
         Item::ModDecl { inline: Some(items), .. } => for it in items { check_item(it, backend, structs, out); },
         Item::Extern(ext) => check_extern_block(ext, backend, structs, out),
         _ => {}
