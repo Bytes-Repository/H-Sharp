@@ -106,6 +106,34 @@ impl TypeChecker {
                     }
                     _ => None,
                 };
+                // [FIXED] Tuple positional access (`.0`, `.1`, ...) had no
+                // arm here at all — a `HType::Tuple` base always fell
+                // through the struct-field lookup below (which only knows
+                // `HType::Named`) straight to the final `None => HType::Any`
+                // catch-all, so `x.0`/`x.1` on ANY tuple, anywhere,
+                // inferred as `Any` regardless of the tuple's actual
+                // element types. That's what made every `let (a, b) =
+                // some_call()` — which the parser desugars to a hidden
+                // `let __destructure = some_call(); let a = __destructure.0;
+                // let b = __destructure.1;` (see parser.rs's `parse_let`)
+                // — silently lose both `a`'s and `b`'s real types, and made
+                // an explicitly-annotated `let t: (A, B) = ...; t.0; t.1;`
+                // just as broken. Handling it here, symmetrically with the
+                // struct-field case, fixes both call sites at once since
+                // they desugar to the exact same `FieldAccess` node.
+                if let HType::Tuple(elems) = &base_ty {
+                    return match field.parse::<usize>() {
+                        Ok(idx) if idx < elems.len() => elems[idx].clone(),
+                        _ => {
+                            self.err_hint(
+                                span.clone(),
+                                format!("tuple of {} element(s) has no field `.{}`", elems.len(), field),
+                                "tuple fields are accessed positionally as `.0`, `.1`, ... up to (len - 1)".to_string(),
+                            );
+                            HType::Any
+                        }
+                    };
+                }
                 match named.and_then(|n| self.structs.get(&n).map(|f| (n, f.clone()))) {
                     Some((struct_name, fields)) => {
                         match fields.iter().find(|(fname, _)| fname == field) {
