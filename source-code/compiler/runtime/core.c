@@ -390,6 +390,35 @@ hsh_string hsh_hostname(void) {
     return buf;
 }
 
+/* date::format(ts, fmt) / the direct `__builtin_date_format(ts, fmt)` a
+ * few std-adjacent callers use (e.g. a shell prompt's clock, a history
+ * list's timestamps) — thin `strftime` wrapper. The interpreter's own
+ * version is deliberately a "lite" reimplementation supporting only a
+ * handful of codes (`%Y %m %d %H %M %S`, per its own doc comment) rather
+ * than the real libc `strftime`, presumably to keep interpreter behavior
+ * identical across platforms without relying on the host libc's locale
+ * data — but every one of those codes IS a standard, locale-independent
+ * strftime conversion, so for the LLVM/AOT backend (this runtime, always
+ * compiled against and run against a real host libc anyway) calling the
+ * real `strftime` directly is strictly a superset of the interpreter's
+ * behavior for any format string that only uses those codes, and simply
+ * supports more if a caller ever uses others. `localtime_r` (not
+ * `gmtime_r`) to match a shell prompt's/history's expectation of
+ * wall-clock local time, not UTC. Truncates rather than growing the
+ * buffer on a pathological format string — 256 bytes covers any
+ * reasonable date/time format many times over. */
+hsh_string hsh_date_format(int64_t ts, hsh_string fmt) {
+    time_t t = (time_t)ts;
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+    char buf[256];
+    size_t n = strftime(buf, sizeof(buf), (fmt && fmt[0]) ? fmt : "%Y-%m-%d %H:%M:%S", &tm_buf);
+    char* out = (char*)hsh_alloc(n + 1);
+    memcpy(out, buf, n);
+    out[n] = '\0';
+    return out;
+}
+
 int64_t hsh_getpid(void) { return (int64_t)getpid(); }
 
 hsh_string hsh_getenv(hsh_string key) {
@@ -1433,6 +1462,63 @@ HshArray *hsh_env_args(void) {
         a->data[a->len++] = (int64_t)(uintptr_t)_hsh_argv[i];
     }
     return a;
+}
+
+/* strings::sort(arr) / the direct `__builtin_sort_strings(arr)` call —
+ * alphabetical sort of a `[string]` array, following exactly the same
+ * `HshArray*`-of-`char*` construction `hsh_env_args` above already does
+ * (this comment intentionally repeats that one's layout note rather than
+ * assuming the reader has it in view): each element of the array is an
+ * `int64_t` that's really a `char*` in disguise, cast back for `strcmp`
+ * and cast forward again into the result array. Sorts a fresh copy
+ * (`qsort` in place on `data` after copying it out) rather than mutating
+ * the input in place — H# arrays are otherwise treated as
+ * copy-on-mutation values everywhere else in this runtime (see
+ * `hsh_array_push`'s grow-and-copy behavior), so a sort that silently
+ * reordered the caller's original backing storage would be the one
+ * array operation that broke that convention. */
+static int hsh_strcmp_for_qsort(const void* a, const void* b) {
+    const char* sa = (const char*)(uintptr_t)(*(const int64_t*)a);
+    const char* sb = (const char*)(uintptr_t)(*(const int64_t*)b);
+    return strcmp(sa ? sa : "", sb ? sb : "");
+}
+
+HshArray *hsh_sort_strings(HshArray *a) {
+    if (!a) return hsh_array_new();
+    HshArray *r = hsh_arr_alloc(a->len);
+    r->len = a->len;
+    for (int64_t i = 0; i < a->len; i++) r->data[i] = a->data[i];
+    if (r->len > 1) qsort(r->data, (size_t)r->len, sizeof(int64_t), hsh_strcmp_for_qsort);
+    return r;
+}
+
+/* strings::split_whitespace(s) / the direct
+ * `__builtin_str_split_whitespace(s)` call — splits on any run of
+ * whitespace (space, tab, newline, CR — `isspace()`), discarding empty
+ * fields between/around runs (so `"  a   b  "` is `["a", "b"]`, not
+ * `["", "a", "", "", "b", ""]`) — the conventional meaning of "split on
+ * whitespace" (matches Rust's `str::split_whitespace`, Python's
+ * `str.split()` with no separator, etc.), as opposed to a delimiter
+ * split that preserves empty fields. Each returned token is a fresh
+ * `hsh_alloc`'d copy (never a pointer into the original `s`), consistent
+ * with every other string-returning function in this runtime, since `s`
+ * may be arena/caller-owned memory this array needs to outlive. */
+HshArray *hsh_str_split_whitespace(hsh_string s) {
+    HshArray *out = hsh_array_new();
+    if (!s) return out;
+    size_t i = 0, n = strlen(s);
+    while (i < n) {
+        while (i < n && isspace((unsigned char)s[i])) i++;
+        if (i >= n) break;
+        size_t start = i;
+        while (i < n && !isspace((unsigned char)s[i])) i++;
+        size_t len = i - start;
+        char* tok = (char*)hsh_alloc(len + 1);
+        memcpy(tok, s + start, len);
+        tok[len] = '\0';
+        out = hsh_array_push(out, (int64_t)(uintptr_t)tok);
+    }
+    return out;
 }
 
 /* ── struct / field access helpers ──────────────────────────────────────────
