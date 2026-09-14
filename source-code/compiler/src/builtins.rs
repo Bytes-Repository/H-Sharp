@@ -239,6 +239,15 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_array_contains: FunctionValue<'ctx>,
     // ── env::args() ──────────────────────────────────────────────────────
     pub hsh_env_args:      FunctionValue<'ctx>,
+    // date::format / __builtin_date_format, strings::sort /
+    // __builtin_sort_strings, strings::split_whitespace /
+    // __builtin_str_split_whitespace — newly implemented in core.c (see
+    // its doc comments on each). `hsh_sort_strings`/
+    // `hsh_str_split_whitespace` follow `hsh_env_args`'s existing
+    // `HshArray*`-of-`char*` construction immediately above.
+    pub hsh_date_format: FunctionValue<'ctx>,
+    pub hsh_sort_strings: FunctionValue<'ctx>,
+    pub hsh_str_split_whitespace: FunctionValue<'ctx>,
     // ── Struct helpers ────────────────────────────────────────────────────
     pub hsh_struct_new:    FunctionValue<'ctx>,
     pub hsh_struct_get:    FunctionValue<'ctx>,
@@ -484,6 +493,11 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_array_contains: ppi("hsh_array_contains"),
             // env::args()
             hsh_env_args:      np("hsh_env_args"),
+            // (i64, ptr) -> ptr — no existing shorthand closure covers
+            // this exact mixed shape, so declared directly.
+            hsh_date_format: decl("hsh_date_format", ptr.fn_type(&[i64t.into(), ptr.into()], false)),
+            hsh_sort_strings: pp("hsh_sort_strings"),
+            hsh_str_split_whitespace: pp("hsh_str_split_whitespace"),
             // Struct helpers
             hsh_struct_new:    ip("hsh_struct_new"),
             hsh_struct_get:    decl("hsh_struct_get", i64t.fn_type(&[ptr.into(), i64t.into()], false)),
