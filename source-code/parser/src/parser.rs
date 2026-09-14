@@ -1512,7 +1512,25 @@ impl Parser {
                 }
                 self.expect(&TokenKind::RBrace)?;
                 let s = start.merge(&self.current().span);
-                let full_name = segments.join("::");
+                // [FIXED] This used to keep the FULL joined path
+                // (`segments.join("::")`, e.g. "git_info::GitInfo") as the
+                // struct literal's type name — inconsistent with
+                // `parse_type_base` just above, which deliberately keeps
+                // only the *last* segment for a qualified type reference,
+                // since (per that function's own comment) struct/enum
+                // names are looked up globally by their bare name
+                // everywhere in the typechecker and codegen; mod-file
+                // inlining doesn't namespace type definitions. The
+                // mismatch meant `fn f() -> git_info::GitInfo is ... return
+                // git_info::GitInfo { ... } end` failed to typecheck: the
+                // declared return type correctly resolved to bare
+                // `GitInfo`, but the struct literal's inferred type stayed
+                // the distinct, never-matching `Named("git_info::GitInfo")`
+                // — "expected `GitInfo`, found `git_info::GitInfo`" even
+                // though it's the exact same struct. Same fix: keep only
+                // the last segment, matching every other qualified-name
+                // lookup in this compiler.
+                let full_name = segments.last().cloned().unwrap_or_default();
                 return Ok(Expr::StructLit(full_name, fields, s));
             }
 
