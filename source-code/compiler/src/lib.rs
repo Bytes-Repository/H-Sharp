@@ -14,6 +14,7 @@ pub mod typechecker;
 pub mod optimize_ast;
 pub mod builtins_registry;
 pub mod features;
+pub mod reachability;
 pub mod monomorphize;
 pub mod const_lowering;
 pub mod stdlib_shims;
