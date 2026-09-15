@@ -290,6 +290,27 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_string_ends_with:   FunctionValue<'ctx>,
     pub hsh_string_len:      FunctionValue<'ctx>,
     pub hsh_array_remove:    FunctionValue<'ctx>,
+    // ── newly implemented on Llvm this session (see runtime/core.c and
+    // builtins_registry.rs's matching BuiltinSpec doc comments) ────────
+    pub hsh_io_read_char:      FunctionValue<'ctx>,
+    pub hsh_conv_int_to_hex:   FunctionValue<'ctx>,
+    pub hsh_conv_float_to_int: FunctionValue<'ctx>,
+    pub hsh_fs_read_bytes:     FunctionValue<'ctx>,
+    pub hsh_fs_write_bytes:    FunctionValue<'ctx>,
+    pub hsh_fs_read_lines:     FunctionValue<'ctx>,
+    pub hsh_fs_walk:           FunctionValue<'ctx>,
+    pub hsh_fs_modified_time:  FunctionValue<'ctx>,
+    pub hsh_fs_temp_file:      FunctionValue<'ctx>,
+    pub hsh_fs_list_dir:       FunctionValue<'ctx>,
+    pub hsh_fs_copy:           FunctionValue<'ctx>,
+    pub hsh_fs_rmdir:          FunctionValue<'ctx>,
+    pub hsh_str_to_char_code:  FunctionValue<'ctx>,
+    pub hsh_char_code_to_str:  FunctionValue<'ctx>,
+    pub hsh_str_index_of:      FunctionValue<'ctx>,
+    pub hsh_process_run_args:  FunctionValue<'ctx>,
+    pub hsh_process_spawn:     FunctionValue<'ctx>,
+    pub hsh_process_kill:      FunctionValue<'ctx>,
+    pub hsh_process_which:     FunctionValue<'ctx>,
 }
 
 impl<'ctx> LlvmBuiltins<'ctx> {
@@ -534,6 +555,26 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_string_ends_with:   ppi("hsh_string_ends_with"),
             hsh_string_len:      pi("hsh_string_len"),
             hsh_array_remove:    decl("hsh_array_remove", i64t.fn_type(&[ptr.into(), i64t.into()], false)),
+            // ── newly implemented on Llvm this session ──────────────────
+            hsh_io_read_char:      np("hsh_io_read_char"),
+            hsh_conv_int_to_hex:   ip("hsh_conv_int_to_hex"),
+            hsh_conv_float_to_int: decl("hsh_conv_float_to_int", i64t.fn_type(&[f64t.into()], false)),
+            hsh_fs_read_bytes:     pp("hsh_fs_read_bytes"),
+            hsh_fs_write_bytes:    decl("hsh_fs_write_bytes", i64t.fn_type(&[ptr.into(), ptr.into()], false)),
+            hsh_fs_read_lines:     pp("hsh_fs_read_lines"),
+            hsh_fs_walk:           pp("hsh_fs_walk"),
+            hsh_fs_modified_time:  pi("hsh_fs_modified_time"),
+            hsh_fs_temp_file:      pp("hsh_fs_temp_file"),
+            hsh_fs_list_dir:       pp("hsh_fs_list_dir"),
+            hsh_fs_copy:           ppi("hsh_fs_copy"),
+            hsh_fs_rmdir:          pi("hsh_fs_rmdir"),
+            hsh_str_to_char_code:  pi("hsh_str_to_char_code"),
+            hsh_char_code_to_str:  ip("hsh_char_code_to_str"),
+            hsh_str_index_of:      ppi("hsh_str_index_of"),
+            hsh_process_run_args:  ppp("hsh_process_run_args"),
+            hsh_process_spawn:     pi("hsh_process_spawn"),
+            hsh_process_kill:      decl("hsh_process_kill", i64t.fn_type(&[i64t.into()], false)),
+            hsh_process_which:     pp("hsh_process_which"),
         }
     }
 }
