@@ -5661,6 +5661,82 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let call = self.call_coerced(self.builtins.hsh_array_remove, &[a.into(), i.into()], "arm");
                            Ok(self.unwrap_call(call))
                        }
+                       // ── newly implemented on Llvm this session — reached via
+                       // `resolve_builtin_dunder_llvm` (builtins_registry.rs) from
+                       // each `__builtin_*` name a std/*.h# wrapper calls. See
+                       // each function's BuiltinSpec doc comment and its C
+                       // implementation in runtime/core.c for the details.
+                       "io_read_char" => {
+                           let call = self.call_coerced(self.builtins.hsh_io_read_char, &[], "readchar");
+                           Ok(self.unwrap_call(call))
+                       }
+                       // conv::str_to_float reuses the existing hsh_atof symbol
+                       // (already declared for the scalar-parse family) rather
+                       // than a second, identical C function.
+                       "conv_str_to_float" => {
+                           let s = str_arg!(0);
+                           let r = self.call_coerced(self.builtins.hsh_atof, &[s.into()], "s2f");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "conv_int_to_hex" => {
+                           let n = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.i64_type().into()))? }
+                           else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_conv_int_to_hex, &[n.into()], "i2hex");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "conv_float_to_int" => {
+                           let f = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.f64_type().into()))? }
+                           else { self.ctx.f64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_conv_float_to_int, &[f.into()], "f2i");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "fs_read_bytes" => call1!(self.builtins.hsh_fs_read_bytes, "frb"),
+                       "fs_write_bytes" => {
+                           let p = self.expr(&args[0], None)?;
+                           let b = self.expr(&args[1], None)?;
+                           let call = self.call_coerced(self.builtins.hsh_fs_write_bytes, &[p.into(), b.into()], "fwb");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "fs_read_lines" => call1!(self.builtins.hsh_fs_read_lines, "frl"),
+                       "fs_walk"       => call1!(self.builtins.hsh_fs_walk, "fwalk"),
+                       "fs_modified_time" => call1!(self.builtins.hsh_fs_modified_time, "fmtime"),
+                       "fs_temp_file"     => call1!(self.builtins.hsh_fs_temp_file, "ftmp"),
+                       "fs_list_dir"      => call1!(self.builtins.hsh_fs_list_dir, "fld"),
+                       "fs_copy" => {
+                           let a = str_arg!(0); let b = str_arg!(1);
+                           let call = self.call_coerced(self.builtins.hsh_fs_copy, &[a.into(), b.into()], "fcp");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "fs_rmdir" => call1!(self.builtins.hsh_fs_rmdir, "frmdir"),
+                       "str_to_char_code" => call1!(self.builtins.hsh_str_to_char_code, "s2cc"),
+                       "char_code_to_str" => {
+                           let n = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.i64_type().into()))? }
+                           else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_char_code_to_str, &[n.into()], "cc2s");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "str_index_of" => call2!(self.builtins.hsh_str_index_of, "sidx"),
+                       // process::run — same shape/contract as `shell`/`cmd`,
+                       // reuses the existing hsh_shell C symbol directly.
+                       "process_run" => call1!(self.builtins.hsh_shell, "prun"),
+                       "process_run_args" => {
+                           let cmd = str_arg!(0);
+                           // second arg is `[string]` (an HshArray*, same
+                           // pointer representation as `bytes`/any other
+                           // array) — not a string, so it must NOT go
+                           // through str_arg!'s i8ptr-hinted coercion.
+                           let argv = self.expr(&args[1], None)?;
+                           let r = self.call_coerced(self.builtins.hsh_process_run_args, &[cmd.into(), argv.into()], "prunargs");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "process_spawn"    => call1!(self.builtins.hsh_process_spawn, "pspawn"),
+                       "process_kill" => {
+                           let pid = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.i64_type().into()))? }
+                           else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_process_kill, &[pid.into()], "pkill");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "process_which" => call1!(self.builtins.hsh_process_which, "pwhich"),
                        _ => {
                            if let Some(&fv) = self.func_vals.get(name) {
                                self.call_user_fn(fv, args, name)
