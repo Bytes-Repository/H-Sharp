@@ -79,10 +79,34 @@ impl TypeChecker {
                 }
                 if let Expr::Path(segments, _) = callee.as_ref() {
                     // Try the fully-qualified name first ("json::parse"),
-                    // then fall back to just the last segment (for modules
-                    // that were namespace-flattened at expansion time).
+                    // then the snake_case mangled name ("json_parse") —
+                    // BUG FIX: this is the spelling `modules.rs`'s
+                    // `mangle_module_items` actually renames a `mod X is
+                    // ... end` block's functions to (`X_fn_name`), and
+                    // the one `codegen.rs`'s own call-resolution path
+                    // tries (`segments.join("_")`) when compiling a
+                    // `module::function(...)` call — so it's the name
+                    // that's actually registered in `self.fns` for any
+                    // module that isn't purely namespace-flattened. Only
+                    // trying `"::"` and the bare last segment meant a
+                    // real cross-module call (e.g. `util::scan_ident_end`)
+                    // silently inferred as `HType::Any` here even though
+                    // codegen resolved and typed it correctly — and that
+                    // `Any` could then trip an otherwise-spurious "return
+                    // type mismatch" for any tuple built around the
+                    // result (see the matching fix in `htype.rs`'s
+                    // `compatible_with`, which was the second half of the
+                    // same failure mode for callers who don't have this
+                    // exact fix applied to their toolchain yet).
+                    // Finally fall back to just the last segment (for
+                    // modules that were namespace-flattened at expansion
+                    // time instead of snake_case-mangled).
                     let full = segments.join("::");
                     if let Some(sig) = self.fns.get(&full).cloned() {
+                        return sig.return_type.clone();
+                    }
+                    let snake = segments.join("_");
+                    if let Some(sig) = self.fns.get(&snake).cloned() {
                         return sig.return_type.clone();
                     }
                     if let Some(last) = segments.last() {
