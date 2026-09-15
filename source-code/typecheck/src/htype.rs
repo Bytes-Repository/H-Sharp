@@ -109,6 +109,31 @@ impl HType {
         if let (HType::Array(a), HType::Array(b)) = (self, other) {
             return a.compatible_with(b);
         }
+        // BUG FIX: the same "`Any` leaks in one level down" problem the
+        // `Array` case above documents also happens for tuples, and for
+        // an even more common reason on this backend: `infer_expr`'s
+        // `Expr::Call` arm for a qualified `module::function(...)` call
+        // only ever tried the `"::"`-joined name and the bare last
+        // segment when looking the callee up in `self.fns` — it never
+        // tried the snake_case `module_function` spelling that
+        // `modules.rs::mangle_module_items` actually renames the
+        // function to (and that `codegen.rs`'s own call-resolution path
+        // already tries — see its `Expr::Path` arm joining segments with
+        // `"_"`). So a cross-module call like `util::scan_ident_end(...)`
+        // fell through every lookup and inferred as `HType::Any`, and
+        // that `Any` then propagated into any tuple built around it —
+        // `return (Tok { ... }, some_var_from_a_module_call)` — even
+        // though every individual element was perfectly well-typed at
+        // runtime. (See the sibling fix in `checker/expr.rs`'s
+        // `Expr::Path` arm, which closes the actual hole; this
+        // element-wise recursion is the same defense-in-depth `Array`
+        // already gets, so a tuple built around *any* still-imprecise
+        // `Any` — an empty-array element, a method call, etc. — degrades
+        // gracefully instead of hard-erroring the whole tuple.)
+        if let (HType::Tuple(a), HType::Tuple(b)) = (self, other) {
+            return a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(x, y)| x.compatible_with(y));
+        }
         false
     }
 
