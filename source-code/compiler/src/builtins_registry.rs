@@ -726,17 +726,22 @@ BuiltinSpec {
     names: &["__builtin_str_to_char_code"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "First character's Unicode codepoint. Interpreter only.",
+    c_symbol: Some("hsh_str_to_char_code"),
+    // Implemented on Llvm this session — decodes the first UTF-8
+    // codepoint (1-4 lead bytes), not just the first raw byte. See
+    // runtime/core.c.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "First character's Unicode codepoint.",
 },
 BuiltinSpec {
     names: &["__builtin_char_code_to_str"],
     params: || vec![HType::Int],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Codepoint back to a one-character string. Interpreter only.",
+    c_symbol: Some("hsh_char_code_to_str"),
+    // Implemented on Llvm this session — UTF-8 encodes the codepoint
+    // (1-4 bytes) into a fresh allocation.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Codepoint back to a one-character string.",
 },
 BuiltinSpec {
     names: &["__builtin_term_width"],
@@ -830,41 +835,54 @@ BuiltinSpec {
     names: &["__builtin_process_run"],
     params: || vec![HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Run a shell command, capture stdout. Interpreter only — AOT has `shell`/`exec` builtins already; std/process.h# doesn't route through them yet.",
+    // Routes straight to the existing `hsh_shell` C symbol (see
+    // codegen.rs's dispatch) — same "through /bin/sh, combined
+    // stdout+stderr" contract std/process.h#'s doc comment already
+    // pointed at.
+    c_symbol: Some("hsh_shell"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Run a shell command, capture stdout. Same operation as `shell`/`cmd` (hsh_shell) on the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_process_run_args"],
-    params: || vec![HType::Str, HType::Str],
+    params: || vec![HType::Str, HType::Array(Box::new(HType::Str))],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Run a program with an explicit argv (no shell). Interpreter only.",
+    c_symbol: Some("hsh_process_run_args"),
+    // Implemented on Llvm this session — builds a real argv[] (program +
+    // the `[string]` args array) and runs it via the existing
+    // fork+execvp `hsh_exec_argv` helper (no shell involved).
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Run a program with an explicit argv (no shell). Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_process_spawn"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Background-spawn a command, return its PID. Interpreter only.",
+    c_symbol: Some("hsh_process_spawn"),
+    // Implemented on Llvm this session — fork+exec via /bin/sh -c,
+    // parent returns immediately without waiting (stdout/stderr
+    // inherited from the parent, matching a background job).
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Background-spawn a command, return its PID. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_process_kill"],
     params: || vec![HType::Int],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Send SIGTERM to a PID. Interpreter only.",
+    c_symbol: Some("hsh_process_kill"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Send SIGTERM to a PID. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_process_which"],
     params: || vec![HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Resolve a command via $PATH. Interpreter only.",
+    c_symbol: Some("hsh_process_which"),
+    // Implemented on Llvm this session — walks $PATH by hand (no
+    // shelling out to the real `which`, so it behaves the same on
+    // minimal containers that don't ship one).
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Resolve a command via $PATH, \"\" if not found. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_cpu_count"],
@@ -1154,81 +1172,91 @@ BuiltinSpec {
     names: &["__builtin_conv_str_to_float"],
     params: || vec![HType::Str],
     ret: || HType::F64,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Parse float, 0.0 on failure. Interpreter only.",
+    // Reuses the existing `hsh_atof` C symbol (already declared for
+    // `hsh_atof`/`__builtin_conv_str_to_float`'s sibling scalar parse —
+    // see codegen.rs's dispatch) rather than adding a second, identical
+    // C function under a new name.
+    c_symbol: Some("hsh_atof"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Parse float, 0.0 on failure. Same operation as `hsh_atof` on the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_conv_int_to_hex"],
     params: || vec![HType::Int],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Int to hex string. Interpreter only.",
+    c_symbol: Some("hsh_conv_int_to_hex"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Int to lowercase hex string (no `0x` prefix). Implemented on Llvm this session — see runtime/core.c.",
 },
 BuiltinSpec {
     names: &["__builtin_conv_float_to_int"],
     params: || vec![HType::F64],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Truncating float-to-int (math_trunc stays float-in-float-out). Interpreter only.",
+    c_symbol: Some("hsh_conv_float_to_int"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Truncating float-to-int (math_trunc stays float-in-float-out). Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_read_bytes"],
     params: || vec![HType::Str],
-    ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Read a file as raw bytes. Interpreter only — AOT's fs_read is text-only.",
+    ret: || HType::Bytes,
+    c_symbol: Some("hsh_fs_read_bytes"),
+    // Implemented on Llvm this session — real binary-safe `fread` into
+    // an `HshArray*` of byte values (see runtime/core.c), unlike
+    // `hsh_read_file`/`fs_read` which are text-only (stop at `strlen`,
+    // so embedded NULs get silently truncated).
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Read a file as raw bytes.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_write_bytes"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Write raw bytes to a file. Interpreter only.",
+    c_symbol: Some("hsh_fs_write_bytes"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Write raw bytes to a file. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_read_lines"],
     params: || vec![HType::Str],
-    ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Read a file as an array of lines. Interpreter only.",
+    ret: || HType::Array(Box::new(HType::Str)),
+    c_symbol: Some("hsh_fs_read_lines"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Read a file as an array of lines (split on \\n, trailing \\r stripped). Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_walk"],
     params: || vec![HType::Str],
-    ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Recursive directory walk. Interpreter only.",
+    ret: || HType::Array(Box::new(HType::Str)),
+    c_symbol: Some("hsh_fs_walk"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Recursive directory walk (yields file paths only). Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_modified_time"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "File mtime as a unix timestamp. Interpreter only.",
+    c_symbol: Some("hsh_fs_modified_time"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "File mtime as a unix timestamp. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_temp_file"],
     params: || vec![HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Create a uniquely-named temp file. Interpreter only.",
+    c_symbol: Some("hsh_fs_temp_file"),
+    // Implemented on Llvm this session via `mkstemp` (creates the file
+    // too, matching the doc contract — not just a name generator).
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Create a uniquely-named (and already-created) temp file, returns its path.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_list_dir"],
     params: || vec![HType::Str],
-    ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "List a directory's entries. Interpreter only — AOT has no directory-listing builtin yet.",
+    ret: || HType::Array(Box::new(HType::Str)),
+    c_symbol: Some("hsh_fs_list_dir"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "List a directory's entries (bare names, `.`/`..` excluded). Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_sort_by"],
@@ -1361,9 +1389,11 @@ BuiltinSpec {
     names: &["__builtin_io_read_char"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Read one byte from stdin. Interpreter only.",
+    c_symbol: Some("hsh_io_read_char"),
+    // Implemented on Llvm this session: `getchar()` off stdin, returned
+    // as a one-character string ("" on EOF) — see runtime/core.c.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Read one byte from stdin (\"\" on EOF).",
 },
 BuiltinSpec {
     names: &["__builtin_io_write_no_nl"],
@@ -1509,9 +1539,9 @@ BuiltinSpec {
     names: &["__builtin_str_index_of"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Index of the first occurrence of a substring, -1 if absent. Interpreter only.",
+    c_symbol: Some("hsh_str_index_of"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Index of the first occurrence of a substring, -1 if absent. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_str_is_numeric"],
@@ -1825,17 +1855,23 @@ BuiltinSpec {
     names: &["__builtin_fs_copy"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Copy a file. Interpreter only — AOT has no file-copy builtin yet.",
+    c_symbol: Some("hsh_fs_copy"),
+    // Implemented on Llvm this session — binary-safe (fread/fwrite by
+    // exact byte count, not text/strlen-based like hsh_read_file).
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Copy a file. Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_rmdir"],
     params: || vec![HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Remove an empty directory (non-recursive). Interpreter only — AOT only has the recursive `fs_remove_dir`, which this deliberately doesn't alias to (different, more destructive semantics).",
+    c_symbol: Some("hsh_fs_rmdir"),
+    // Implemented on Llvm this session as a direct `rmdir(2)` call —
+    // deliberately NOT aliased to the existing (recursive, much more
+    // destructive) `hsh_remove_dir_recursive`/`fs_remove_dir`, matching
+    // this doc's own note that the two have different semantics.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Remove an empty directory (non-recursive; fails if non-empty). Implemented on Llvm this session.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_kernel_version"],
@@ -2062,6 +2098,31 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         "io_read_line"    => "io_readline",
         "io_write_no_nl"  => "io_print",
         "io_flush"        => "io_flush",
+        // ── newly implemented on Llvm this session — real C runtime
+        // functions in runtime/core.c, declared in builtins.rs, dispatched
+        // in codegen.rs's `call_fn` under these exact bare names. See each
+        // BuiltinSpec's doc comment above for the implementation notes. ──
+        "io_read_char"        => "io_read_char",
+        "conv_str_to_float"   => "conv_str_to_float", // -> hsh_atof, see codegen.rs
+        "conv_int_to_hex"     => "conv_int_to_hex",
+        "conv_float_to_int"   => "conv_float_to_int",
+        "fs_read_bytes"       => "fs_read_bytes",
+        "fs_write_bytes"      => "fs_write_bytes",
+        "fs_read_lines"       => "fs_read_lines",
+        "fs_walk"             => "fs_walk",
+        "fs_modified_time"    => "fs_modified_time",
+        "fs_temp_file"        => "fs_temp_file",
+        "fs_list_dir"         => "fs_list_dir",
+        "fs_copy"             => "fs_copy",
+        "fs_rmdir"            => "fs_rmdir",
+        "str_to_char_code"    => "str_to_char_code",
+        "char_code_to_str"    => "char_code_to_str",
+        "str_index_of"        => "str_index_of",
+        "process_run"         => "process_run",
+        "process_run_args"    => "process_run_args",
+        "process_spawn"       => "process_spawn",
+        "process_kill"        => "process_kill",
+        "process_which"       => "process_which",
         _ => return None,
     })
 }
