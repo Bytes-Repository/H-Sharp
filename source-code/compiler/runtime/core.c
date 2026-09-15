@@ -13,6 +13,7 @@
 #include <math.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <dirent.h>  /* fs::list_dir / fs::walk (added this session) */
 
 /* Global argc/argv storage — written by the H# main() entry point
  * (codegen emits: _hsh_argc = argc; _hsh_argv = argv;)
@@ -30,6 +31,24 @@ typedef int64_t     hsh_int;
  * but needed by hsh_strcat which comes first in the file. */
 static void* hsh_alloc(uint64_t n);
 typedef double      hsh_float;
+
+/* H#'s dynamic-array representation — moved up from its original spot
+ * in the "── Dynamic arrays ──" section (further down this file) so
+ * that functions added this session earlier in the file
+ * (fs::read_bytes/write_bytes/read_lines/walk/list_dir,
+ * process::run_args) can dereference `->len`/`->data` directly instead
+ * of only holding an opaque pointer. `hsh_array_new`/`hsh_array_push`
+ * themselves are still *defined* down in that section (an ordinary
+ * forward declaration is enough for those, since nothing here needs to
+ * see inside them) — only the struct layout needed to move. */
+struct HshArray {
+    int64_t len;
+    int64_t cap;
+    int64_t data[1]; /* flexible array */
+};
+typedef struct HshArray HshArray;
+HshArray *hsh_array_new(void);
+HshArray *hsh_array_push(HshArray *a, int64_t val);
 
 /* ── Core I/O ────────────────────────────────────────────────────────────── */
 
@@ -284,6 +303,16 @@ hsh_string hsh_trim(hsh_string s) {
 
 int64_t hsh_str_contains(hsh_string h, hsh_string n) {
     return (h && n && strstr(h, n)) ? 1 : 0;
+}
+
+/* strings::index_of(s, sub) -> int. Byte offset of the first
+ * occurrence, -1 if absent (matches the interpreter's contract — see
+ * builtins_registry.rs). An empty `sub` matches at offset 0, same as
+ * strstr's own documented behavior. Added this session. */
+int64_t hsh_str_index_of(hsh_string s, hsh_string sub) {
+    if (!s || !sub) return -1;
+    const char* found = strstr(s, sub);
+    return found ? (int64_t)(found - s) : -1;
 }
 
 hsh_string hsh_to_upper(hsh_string s) {
@@ -1013,6 +1042,24 @@ int64_t hsh_str_to_int(hsh_string s) {
     return (int64_t)strtoll(s, NULL, 10);
 }
 
+/* conv::int_to_hex(n) — lowercase hex, no "0x" prefix (matches the
+ * interpreter's formatting). Added this session. */
+hsh_string hsh_conv_int_to_hex(int64_t n) {
+    char buf[20];
+    int len = snprintf(buf, sizeof(buf), "%llx", (unsigned long long)n);
+    char* out = (char*)hsh_alloc((size_t)len + 1);
+    if (!out) return "";
+    memcpy(out, buf, (size_t)len + 1);
+    return out;
+}
+
+/* conv::float_to_int(f) — truncating (toward zero), matching C's
+ * float-to-int cast semantics and the interpreter's `as i64`. Added
+ * this session. */
+int64_t hsh_conv_float_to_int(double f) {
+    return (int64_t)f;
+}
+
 /* env::get(name) — "" if unset, matching every other "absent value"
  * convention in this runtime (hsh_json_get, hsh_run_cmd_last_stdout, …
  * all return "" rather than a null pointer H# code would have to
@@ -1034,6 +1081,19 @@ hsh_string hsh_env_read_line(void) {
     while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
     char* out = (char*)hsh_alloc(n + 1);
     memcpy(out, buf, n + 1);
+    return out;
+}
+
+/* io::read_char() — one raw byte from stdin as a 1-character string,
+ * "" on EOF or a read error. Added this session (previously interpreter
+ * only — see builtins_registry.rs's matching BuiltinSpec). */
+hsh_string hsh_io_read_char(void) {
+    int c = getchar();
+    if (c == EOF) return "";
+    char* out = (char*)hsh_alloc(2);
+    if (!out) return "";
+    out[0] = (char)c;
+    out[1] = '\0';
     return out;
 }
 
@@ -1141,6 +1201,83 @@ hsh_string hsh_py_repr(hsh_string s) {
     }
     out[w++] = '\''; out[w] = '\0';
     return out;
+}
+
+/* ── process:: v2 (added this session) ───────────────────────────────────── */
+
+/* process::run_args(cmd, args: [string]) -> string. Builds a real
+ * argv[] from `cmd` + the `[string]` array and runs it via the
+ * existing fork+execvp `hsh_exec_argv` helper — no shell, no
+ * injection, same contract as `exec(...)`. Capped at 63 extra args
+ * (plenty for this runtime's purposes; a longer argv silently
+ * truncates rather than overflowing the fixed-size buffer). */
+hsh_string hsh_process_run_args(hsh_string cmd, HshArray *args) {
+    if (!cmd) return "";
+    enum { MAXA = 64 };
+    char* argv[MAXA + 1];
+    argv[0] = (char*)cmd;
+    int n = 0;
+    if (args) {
+        n = (int)args->len;
+        if (n > MAXA - 1) n = MAXA - 1;
+        for (int i = 0; i < n; i++) argv[i + 1] = (char*)(uintptr_t)args->data[i];
+    }
+    argv[n + 1] = NULL;
+    return hsh_exec_argv(argv);
+}
+
+/* process::spawn(cmd) -> int (pid). Backgrounds `cmd` via `/bin/sh -c`
+ * (so pipes/redirects/&&/etc. in `cmd` still work, same shell contract
+ * as `shell()`), does NOT wait for it, and does not capture its
+ * output (inherits the parent's stdout/stderr — the natural behavior
+ * for a detached background job). Returns -1 on fork failure. */
+int64_t hsh_process_spawn(hsh_string cmd) {
+    if (!cmd) return -1;
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Detach from the controlling terminal's signal delivery, same
+         * spirit as a real shell backgrounding a job with `&`. */
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    return (int64_t)pid;
+}
+
+/* process::kill(pid) -> bool. Sends SIGTERM (not SIGKILL) — same
+ * "polite" default every other shell/process API uses, letting the
+ * target clean up if it wants to. */
+int64_t hsh_process_kill(int64_t pid) {
+    return (kill((pid_t)pid, SIGTERM) == 0) ? 1 : 0;
+}
+
+/* process::which(cmd) -> string. Hand-rolled $PATH search (rather than
+ * shelling out to a real `which`, which isn't guaranteed to exist on a
+ * minimal container) — first `$PATH` entry where `cmd` exists and is
+ * executable, "" if none. An already-qualified `cmd` (contains a `/`)
+ * is checked directly instead of being searched for. */
+hsh_string hsh_process_which(hsh_string cmd) {
+    if (!cmd || cmd[0] == '\0') return "";
+    if (strchr(cmd, '/')) {
+        return (access(cmd, X_OK) == 0) ? strdup(cmd) : "";
+    }
+    const char* path_env = getenv("PATH");
+    if (!path_env) return "";
+    char* path_copy = strdup(path_env);
+    if (!path_copy) return "";
+    const char* result = "";
+    char* saveptr = NULL;
+    for (char* dir = strtok_r(path_copy, ":", &saveptr); dir; dir = strtok_r(NULL, ":", &saveptr)) {
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", dir, cmd);
+        if (access(full, X_OK) == 0) {
+            result = strdup(full);
+            break;
+        }
+    }
+    free(path_copy);
+    return result;
 }
 
 /* ── Random ──────────────────────────────────────────────────────────────── */
@@ -1286,6 +1423,210 @@ int64_t hsh_rename(hsh_string from, hsh_string to) {
     return (from && to && rename(from, to) == 0) ? 1 : 0;
 }
 
+/* ── Filesystem v2 (added this session) ─────────────────────────────────────
+ * fs::read_bytes / fs::write_bytes / fs::read_lines / fs::walk /
+ * fs::modified_time / fs::temp_file / fs::list_dir / fs::copy / fs::rmdir —
+ * see each's BuiltinSpec doc comment in builtins_registry.rs for the
+ * "why" behind each design choice. All previously interpreter-only.
+ */
+
+/* fs::read_bytes(path) -> bytes. Binary-safe: reads the file's exact
+ * byte count via fseek/ftell/fread rather than treating it as a C
+ * string, so embedded NUL bytes survive (unlike hsh_read_file, which is
+ * fine for text but would silently truncate at the first NUL if
+ * something downstream ever called strlen() on its result). Returns an
+ * HshArray* of byte values 0-255 — the exact same representation
+ * hsh_string_to_bytes already uses for `bytes`. */
+HshArray *hsh_fs_read_bytes(hsh_string path) {
+    HshArray *out = hsh_array_new();
+    if (!path) return out;
+    FILE* f = fopen(path, "rb");
+    if (!f) return out;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0) { fclose(f); return out; }
+    unsigned char* buf = (unsigned char*)malloc((size_t)sz);
+    if (!buf) { fclose(f); return out; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    for (size_t i = 0; i < got; i++) out = hsh_array_push(out, (int64_t)buf[i]);
+    free(buf);
+    return out;
+}
+
+/* fs::write_bytes(path, data: bytes) -> bool. Writes each element of
+ * the HshArray* (masked to a byte, same convention hsh_bytes_to_string
+ * already uses) via a single fwrite. */
+int64_t hsh_fs_write_bytes(hsh_string path, HshArray *bytes) {
+    if (!path) return 0;
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    if (bytes && bytes->len > 0) {
+        unsigned char* buf = (unsigned char*)malloc((size_t)bytes->len);
+        if (buf) {
+            for (int64_t i = 0; i < bytes->len; i++) buf[i] = (unsigned char)(bytes->data[i] & 0xFF);
+            fwrite(buf, 1, (size_t)bytes->len, f);
+            free(buf);
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+/* fs::read_lines(path) -> [string]. Splits on '\n'; a trailing '\r' on
+ * each line is stripped so CRLF files behave the same as LF-only ones
+ * (matches every other line-oriented helper in this runtime — see
+ * hsh_env_read_line above). A final line with no trailing newline is
+ * still included, matching Rust's `str::lines()` (which this is a
+ * straight port of the spirit of). */
+HshArray *hsh_fs_read_lines(hsh_string path) {
+    HshArray *out = hsh_array_new();
+    if (!path) return out;
+    FILE* f = fopen(path, "rb");
+    if (!f) return out;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz < 0) { fclose(f); return out; }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return out; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
+    size_t start = 0;
+    for (size_t i = 0; i <= got; i++) {
+        if (i == got || buf[i] == '\n') {
+            if (i == got && i == start) break; /* no trailing empty line */
+            size_t end = i;
+            if (end > start && buf[end - 1] == '\r') end--;
+            size_t len = end - start;
+            char* line = (char*)hsh_alloc(len + 1);
+            memcpy(line, buf + start, len);
+            line[len] = '\0';
+            out = hsh_array_push(out, (int64_t)(uintptr_t)line);
+            start = i + 1;
+        }
+    }
+    free(buf);
+    return out;
+}
+
+/* fs::walk(root) -> [string]. Recursive depth-first directory walk,
+ * yielding full paths of every regular file found (directories
+ * themselves aren't yielded — matches the doc comment's "yields file
+ * paths only"). Symlinks are not followed (lstat via readdir's d_type
+ * where available, falling back to stat), to avoid infinite recursion
+ * on a symlink cycle. */
+static void hsh_fs_walk_into(const char* dir, HshArray** out) {
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        size_t dl = strlen(dir), nl = strlen(ent->d_name);
+        char* path = (char*)malloc(dl + nl + 2);
+        if (!path) continue;
+        int need_slash = (dl > 0 && dir[dl - 1] != '/');
+        snprintf(path, dl + nl + 2, "%s%s%s", dir, need_slash ? "/" : "", ent->d_name);
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                hsh_fs_walk_into(path, out);
+                free(path);
+            } else {
+                char* kept = (char*)hsh_alloc(strlen(path) + 1);
+                if (kept) { memcpy(kept, path, strlen(path) + 1); *out = hsh_array_push(*out, (int64_t)(uintptr_t)kept); }
+                free(path);
+            }
+        } else {
+            free(path);
+        }
+    }
+    closedir(d);
+}
+
+HshArray *hsh_fs_walk(hsh_string root) {
+    HshArray *out = hsh_array_new();
+    if (!root) return out;
+    hsh_fs_walk_into(root, &out);
+    return out;
+}
+
+/* fs::list_dir(path) -> [string]. One level only (unlike fs::walk),
+ * bare entry names (not full paths), "." and ".." excluded. */
+HshArray *hsh_fs_list_dir(hsh_string path) {
+    HshArray *out = hsh_array_new();
+    if (!path) return out;
+    DIR* d = opendir(path);
+    if (!d) return out;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        size_t n = strlen(ent->d_name);
+        char* name = (char*)hsh_alloc(n + 1);
+        if (name) { memcpy(name, ent->d_name, n + 1); out = hsh_array_push(out, (int64_t)(uintptr_t)name); }
+    }
+    closedir(d);
+    return out;
+}
+
+/* fs::modified_time(path) -> int (unix seconds), -1 if the path
+ * doesn't exist / stat fails. */
+int64_t hsh_fs_modified_time(hsh_string path) {
+    if (!path) return -1;
+    struct stat st;
+    return (stat(path, &st) == 0) ? (int64_t)st.st_mtime : -1;
+}
+
+/* fs::temp_file(prefix) -> string. Actually creates the file (via
+ * mkstemp, so the name is guaranteed unique and reserved — not just a
+ * generated name someone else could race), and returns its path.
+ * "" on failure. */
+hsh_string hsh_fs_temp_file(hsh_string prefix) {
+    const char* dir = getenv("TMPDIR");
+    if (!dir || dir[0] == '\0') dir = "/tmp";
+    const char* pfx = prefix ? prefix : "hsh";
+    char tmpl[4096];
+    snprintf(tmpl, sizeof(tmpl), "%s/%sXXXXXX", dir, pfx);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return "";
+    close(fd);
+    size_t n = strlen(tmpl);
+    char* out = (char*)hsh_alloc(n + 1);
+    if (!out) return "";
+    memcpy(out, tmpl, n + 1);
+    return out;
+}
+
+/* fs::copy(src, dst) -> bool. Binary-safe (fread/fwrite by exact byte
+ * count), unlike a text-based read+write which would go through
+ * hsh_read_file/hsh_write_file's NUL-terminated-string assumptions. */
+int64_t hsh_fs_copy(hsh_string src, hsh_string dst) {
+    if (!src || !dst) return 0;
+    FILE* in = fopen(src, "rb");
+    if (!in) return 0;
+    FILE* out = fopen(dst, "wb");
+    if (!out) { fclose(in); return 0; }
+    char buf[8192];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    }
+    fclose(in);
+    fclose(out);
+    return ok;
+}
+
+/* fs::rmdir(path) -> bool. Non-recursive — fails (returns 0) if the
+ * directory isn't empty, deliberately NOT falling back to the
+ * recursive hsh_remove_dir_recursive (see that BuiltinSpec's doc
+ * comment: different, much more destructive semantics). */
+int64_t hsh_fs_rmdir(hsh_string path) {
+    return (path && rmdir(path) == 0) ? 1 : 0;
+}
+
 /* ── ANSI formatting ─────────────────────────────────────────────────────── */
 
 #define ANSI_FMT(name, code) \
@@ -1377,13 +1718,9 @@ double  hsh_atof_export(hsh_string s)  { return hsh_atof(s); }
  * H# dynamic arrays are represented as HshArray* pointers on the heap.
  * Layout: { int64_t len; int64_t cap; int64_t data[cap]; }
  * All elements are i64 (strings = char*, ints, bools cast to i64).
+ * (struct layout itself now declared up near the top of this file — see
+ * the comment there for why it moved.)
  */
-
-typedef struct {
-    int64_t len;
-    int64_t cap;
-    int64_t data[1]; /* flexible array */
-} HshArray;
 
 static HshArray *hsh_arr_alloc(int64_t cap) {
     if (cap < 4) cap = 4;
@@ -1739,6 +2076,48 @@ HshArray *hsh_string_chars(const char *s) {
         a = hsh_array_push(a, (int64_t)(uintptr_t)ch);
     }
     return a;
+}
+
+/* ── str::char_to_int / str::int_to_char — UTF-8 codepoint <-> string
+ * (added this session; previously interpreter only). Decodes/encodes a
+ * real Unicode codepoint (1-4 byte UTF-8 sequences), not just the raw
+ * first byte, matching the "Unicode codepoint" contract in
+ * builtins_registry.rs's doc comment. */
+int64_t hsh_str_to_char_code(hsh_string s) {
+    if (!s || s[0] == '\0') return 0;
+    const unsigned char* b = (const unsigned char*)s;
+    if (b[0] < 0x80) return b[0];
+    if ((b[0] & 0xE0) == 0xC0 && b[1]) return ((b[0] & 0x1F) << 6) | (b[1] & 0x3F);
+    if ((b[0] & 0xF0) == 0xE0 && b[1] && b[2])
+        return ((b[0] & 0x0F) << 12) | ((b[1] & 0x3F) << 6) | (b[2] & 0x3F);
+    if ((b[0] & 0xF8) == 0xF0 && b[1] && b[2] && b[3])
+        return ((b[0] & 0x07) << 18) | ((b[1] & 0x3F) << 12) | ((b[2] & 0x3F) << 6) | (b[3] & 0x3F);
+    return b[0]; /* malformed lead byte — fall back to the raw byte */
+}
+
+hsh_string hsh_char_code_to_str(int64_t code) {
+    char* out = (char*)hsh_alloc(5);
+    if (!out) return "";
+    if (code < 0) code = 0;
+    if (code < 0x80) {
+        out[0] = (char)code; out[1] = '\0';
+    } else if (code < 0x800) {
+        out[0] = (char)(0xC0 | (code >> 6));
+        out[1] = (char)(0x80 | (code & 0x3F));
+        out[2] = '\0';
+    } else if (code < 0x10000) {
+        out[0] = (char)(0xE0 | (code >> 12));
+        out[1] = (char)(0x80 | ((code >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (code & 0x3F));
+        out[3] = '\0';
+    } else {
+        out[0] = (char)(0xF0 | (code >> 18));
+        out[1] = (char)(0x80 | ((code >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((code >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (code & 0x3F));
+        out[4] = '\0';
+    }
+    return out;
 }
 
 /* ── dir_remove_all — recursive delete ───────────────────────────────────────*/
