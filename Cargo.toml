@@ -7,6 +7,7 @@ members = [
     "source-code/interpreter",
     "source-code/playground", # WASM playground for hsharp-lang.org — pure Rust, no LLVM. See its own Cargo.toml/lib.rs doc comments.
     "source-code/lsp", # Language Server — pure Rust, no LLVM, ships independently of the compiler.
+    "source-code/hlib", # .hlib (HackerOS Lib) archive format reader/writer — pure Rust, no LLVM, no cross-crate deps besides std. See source-code/hlib/src/lib.rs.
 ]
 resolver = "2"
 
