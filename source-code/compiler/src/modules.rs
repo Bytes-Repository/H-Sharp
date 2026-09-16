@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use hsharp_parser::ast::*;
+use hsharp_parser::span::Span;
 use crate::bytes_resolve;
 
 /// Resolved module: parsed AST + source path
@@ -265,6 +266,10 @@ fix one of:\n\
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
                     out.extend(self.resolve_bytes_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
                 }
+                ImportKind::Hlib { name: sub_name, version: sub_version, .. } => {
+                    let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
+                    out.extend(self.resolve_hlib_import(sub_name, sub_version.as_deref(), &ns, &sub_dir)?);
+                }
                 _ => {}
             }
         }
@@ -273,6 +278,147 @@ fix one of:\n\
         let expanded = self.expand_module(mangled, &sub_dir)?;
         out.extend(expanded);
         Ok(out)
+    }
+
+    /// Resolve one `use "hlib -> name[/version]"` import: locate a
+    /// `.hlib` (HackerOS Lib) archive, verify its internal checksums,
+    /// and turn it into a flat `Vec<Item>` — **without** requiring the
+    /// programmer to write a single `extern` block.
+    ///
+    /// Two paths, tried in order:
+    ///
+    ///   1. **AST splice** (the common case — every `h# lib build`
+    ///      output has this unless the source module had zero `pub`
+    ///      items): the archive's `ast` artifact is exactly a
+    ///      `serde_json`-serialized `Vec<Item>` — the *same* `Item` type
+    ///      this compiler already works with — so it's deserialized and
+    ///      mangled/inlined exactly like a `mod` file or a `bytes ->`
+    ///      package. Generics, structs, everything just works, because
+    ///      by the time typecheck sees it, it *is* normal H# source.
+    ///      This is what lets `.hlib` consumption skip `extern` entirely
+    ///      for H#-to-H# libraries.
+    ///   2. **Synthesized `extern`** (fallback — only used when the
+    ///      archive has no `ast` artifact at all, e.g. a closed-source
+    ///      `.hlib` or one produced by Hacker Lang/HackerScript with no
+    ///      H#-shaped AST to give): a single `extern dynamic [rust, ...]`
+    ///      block is built in memory straight from the archive's
+    ///      language-agnostic header (`manifest.exports`), pointing at
+    ///      the `.so` extracted into `~/.hackeros/H#/hlib-cache/`. The
+    ///      programmer still never writes `extern` themselves — the
+    ///      compiler does, internally, from `use "hlib -> x"` alone.
+    ///      Any *generic* export is silently skipped here (there is no
+    ///      AST to expand it from) with a note on stderr.
+    pub fn resolve_hlib_import(
+        &mut self,
+        name: &str,
+        version: Option<&str>,
+        alias: &str,
+        start_dir: &Path,
+    ) -> Result<Vec<Item>, String> {
+        let hlib_path = find_hlib_file(name, version, start_dir)?;
+
+        // Same "only inline once, program-wide" dedup every other import
+        // kind needs (see `inlined_files`'s doc comment).
+        let canonical = std::fs::canonicalize(&hlib_path).unwrap_or_else(|_| hlib_path.clone());
+        if !self.inlined_files.insert(canonical) {
+            return Ok(Vec::new());
+        }
+
+        let archive = hsharp_hlib::HlibArchive::open(&hlib_path)
+            .map_err(|e| format!("cannot open .hlib '{}' at {}: {}", name, hlib_path.display(), e))?;
+        archive
+            .verify_checksums()
+            .map_err(|e| format!(".hlib '{}' failed its internal integrity check: {}", name, e))?;
+
+        // ── Path 1: splice the ast artifact directly ────────────────────
+        if let Some(ast_artifact) = archive.manifest.artifacts_of_kind(hsharp_hlib::ArtifactKind::Ast).next() {
+            let ast_bytes = archive.entry_bytes(&ast_artifact.path).ok_or_else(|| {
+                format!(".hlib '{}': ast artifact listed in manifest but missing from the archive", name)
+            })?;
+            let items: Vec<Item> = serde_json::from_slice(ast_bytes)
+                .map_err(|e| format!(".hlib '{}': cannot parse its ast artifact: {}", name, e))?;
+
+            let sub_dir = hlib_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            let mangled = mangle_module_items(items, alias);
+            return self.expand_module(mangled, &sub_dir);
+        }
+
+        // ── Path 2: synthesize `extern` from the header ─────────────────
+        let host_triple = crate::target::TargetTriple::host().llvm_triple;
+        let so_artifact = archive.manifest.shared_object_for(&host_triple).ok_or_else(|| {
+            format!(
+                ".hlib '{name}' has neither an `ast` artifact nor a `.so` built for this host \
+                 ({host_triple}) — nothing here can be linked. Available native targets: {targets}",
+                name = name,
+                host_triple = host_triple,
+                targets = archive
+                    .manifest
+                    .artifacts_of_kind(hsharp_hlib::ArtifactKind::SharedObject)
+                    .filter_map(|a| a.target.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        })?;
+        let so_bytes = archive.entry_bytes(&so_artifact.path).ok_or_else(|| {
+            format!(".hlib '{}': shared object listed in manifest but missing from the archive", name)
+        })?;
+
+        let cache_dir = hlib_cache_dir()?.join(format!("{}-{}", name, archive.manifest.version));
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("cannot create hlib cache dir {}: {}", cache_dir.display(), e))?;
+        let so_path = cache_dir.join(format!("lib{}.so", name));
+        if !so_path.exists() {
+            std::fs::write(&so_path, so_bytes).map_err(|e| format!("cannot extract .so from '{}': {}", name, e))?;
+        }
+
+        let functions: Vec<ExternFnDecl> = archive
+            .manifest
+            .exports
+            .iter()
+            .filter(|e| !e.generic && matches!(e.kind, hsharp_hlib::ExportedSymbolKind::Function))
+            .map(|e| ExternFnDecl {
+                name: e.name.clone(),
+                params: e
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| Param {
+                        name: format!("arg{i}"),
+                        ty: abi_type_to_type_expr(t),
+                        mutable: false,
+                        span: Span::dummy(),
+                    })
+                    .collect(),
+                return_type: e.returns.as_ref().map(abi_type_to_type_expr),
+                variadic: false,
+                span: Span::dummy(),
+            })
+            .collect();
+
+        let skipped: Vec<&str> = archive.manifest.exports.iter().filter(|e| e.generic).map(|e| e.name.as_str()).collect();
+        if !skipped.is_empty() {
+            eprintln!(
+                "  note: .hlib '{}' — {} generic export(s) skipped (no ast artifact to expand \
+                 them from, only a compiled .so): {}",
+                name,
+                skipped.len(),
+                skipped.join(", ")
+            );
+        }
+        if functions.is_empty() {
+            return Err(format!(
+                ".hlib '{}' has no `ast` artifact and no non-generic function export to bind — nothing to link.",
+                name
+            ));
+        }
+
+        Ok(vec![Item::Extern(ExternBlock {
+            lang: ExternLang::Rust,
+            link_kind: ExternLinkKind::Dynamic,
+            library: Some(so_path.to_string_lossy().to_string()),
+            functions,
+            span: Span::dummy(),
+        })])
     }
 
     /// The single front-end entry point every caller (`hsharp preview`,
@@ -296,6 +442,10 @@ fix one of:\n\
                 ImportKind::BytesRepo { name, version, link, .. } => {
                     let ns = alias.clone().unwrap_or_else(|| name.clone());
                     items.extend(self.resolve_bytes_import(name, version.as_deref(), &ns, *link, entry_dir)?);
+                }
+                ImportKind::Hlib { name, version, .. } => {
+                    let ns = alias.clone().unwrap_or_else(|| name.clone());
+                    items.extend(self.resolve_hlib_import(name, version.as_deref(), &ns, entry_dir)?);
                 }
                 _ => {}
             }
@@ -560,6 +710,79 @@ pub fn hoist_nested_fns(body: &mut Vec<Stmt>, enclosing_name: &str) -> Vec<FnDef
 /// would need that additional rewrite too, and will currently fail to
 /// typecheck/resolve loudly (a clear "unknown type" error) rather than
 /// silently binding to the wrong type, if that gap is ever hit.
+/// Locates a `.hlib` archive by logical name (and optional version),
+/// searching — in order — the declaring file's own `hlibs/` directory,
+/// that directory itself, the enclosing `bytes` project's `hlibs/`
+/// directory (`find_bytes_project_root` walks up to find it, same as
+/// `bytes ->` imports do), the user's personal cache
+/// (`~/.hackeros/H#/hlibs/`), and finally the system-wide location
+/// (`/usr/lib/HackerOS/H#/hlibs/`, alongside the std library — see
+/// `resolve_std_import`'s path constant).
+fn find_hlib_file(name: &str, version: Option<&str>, start_dir: &Path) -> Result<PathBuf, String> {
+    let project_root = bytes_resolve::find_bytes_project_root(start_dir);
+    let mut dirs: Vec<PathBuf> = vec![start_dir.join("hlibs"), start_dir.to_path_buf(), project_root.join("hlibs")];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(home).join(".hackeros").join("H#").join("hlibs"));
+    }
+    dirs.push(PathBuf::from("/usr/lib/HackerOS/H#/hlibs"));
+
+    let filenames: Vec<String> = match version {
+        Some(v) => vec![format!("{name}-{v}.hlib"), format!("{name}.hlib")],
+        None => vec![format!("{name}.hlib")],
+    };
+
+    let mut tried = Vec::new();
+    for dir in &dirs {
+        for fname in &filenames {
+            let p = dir.join(fname);
+            if p.exists() {
+                return Ok(p);
+            }
+            tried.push(p);
+        }
+    }
+    Err(format!(
+        "hlib '{name}' not found. Tried:\n{}\n\n\
+         build one with `h# lib build <file.h#> -o hlibs/{name}.hlib`, \
+         or place a prebuilt archive at one of the paths above.",
+        tried.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
+        name = name,
+    ))
+}
+
+/// Where extracted `.so` files from header-only (no-`ast`) `.hlib`s are
+/// cached, keyed by `<name>-<version>` so two different libraries (or
+/// two versions of the same one) never collide on disk.
+fn hlib_cache_dir() -> Result<PathBuf, String> {
+    let base = std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| "cannot locate a cache directory: $HOME is not set".to_string())?;
+    Ok(base.join(".hackeros").join("H#").join("hlib-cache"))
+}
+
+/// Inverse of `hsharp-cli`'s `hlib_export::lower_type_expr` — turns an
+/// ABI-stable `hsharp_hlib::AbiType` back into a `TypeExpr` suitable for
+/// a synthesized `extern` block's parameter/return types. Structs
+/// (`Opaque`) come back as `&Name` (a reference), not `Name` by value —
+/// H#'s FFI layer requires structs to be passed by pointer (see
+/// `ffi_header.rs`'s `StructByValueFfi` diagnostic), and a `.hlib`'s
+/// header-only fallback path has no other way to know a struct's true
+/// layout anyway, so a borrowed opaque handle is the only sound choice.
+fn abi_type_to_type_expr(t: &hsharp_hlib::AbiType) -> TypeExpr {
+    use hsharp_hlib::AbiType;
+    match t {
+        AbiType::I8 => TypeExpr::I8, AbiType::I16 => TypeExpr::I16,
+        AbiType::I32 => TypeExpr::I32, AbiType::I64 => TypeExpr::I64,
+        AbiType::U8 => TypeExpr::U8, AbiType::U16 => TypeExpr::U16,
+        AbiType::U32 => TypeExpr::U32, AbiType::U64 => TypeExpr::U64,
+        AbiType::F32 => TypeExpr::F32, AbiType::F64 => TypeExpr::F64,
+        AbiType::Bool => TypeExpr::Bool,
+        AbiType::Void => TypeExpr::Void,
+        AbiType::Ptr => TypeExpr::Bytes,
+        AbiType::Opaque { struct_name } => TypeExpr::Ref(Box::new(TypeExpr::Named(struct_name.clone()))),
+    }
+}
+
 fn mangle_module_items(items: Vec<Item>, prefix: &str) -> Vec<Item> {
     let local_fns: HashSet<String> = items.iter().filter_map(|i| match i {
         Item::FnDef(f) => Some(f.name.clone()),
