@@ -2403,6 +2403,12 @@ fn parse_use_path(path: &str, alias: Option<String>, link: ImportLinkKind) -> Op
         let (name, ver) = split_name_ver(rest);
         return Some(ImportKind::BytesRepo { name, version: ver, alias, link });
     }
+    if path.starts_with("hlib") && path.contains(arrow) {
+        // use "hlib -> mylib" from "alias"   (also accepts "hlib -> mylib/1.2.0")
+        let rest = path.splitn(2, arrow).nth(1)?.trim();
+        let (name, ver) = split_name_ver(rest);
+        return Some(ImportKind::Hlib { name, version: ver, alias });
+    }
     if path.starts_with("python") && path.contains(arrow) {
         let rest = path.splitn(2, arrow).nth(1)?.trim();
         let (name, ver) = split_name_ver(rest);
