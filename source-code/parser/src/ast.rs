@@ -58,6 +58,17 @@ pub enum ImportKind {
     /// use "bytes -> pkgname" from "alias"
     /// dynamic use "bytes -> pkgname" from "alias" → `link: Dynamic`
     BytesRepo { name: String, version: Option<String>, alias: Option<String>, link: ImportLinkKind },
+    /// use "hlib -> libname" from "alias" — imports a `.hlib` (HackerOS
+    /// Lib) archive. Resolved by `ModuleResolver` (see
+    /// `compiler::hlib_resolve`): when the archive carries an `ast`
+    /// artifact (the common case — see `h# lib build`), every `pub`
+    /// item inside it is spliced into the program directly, same as a
+    /// `mod` file — no `extern` block, no manual binding step. Falls
+    /// back to a synthesized `extern` block (from the archive's
+    /// language-agnostic header) only for `.hlib`s that ship a compiled
+    /// `.so` with no `ast` artifact at all (e.g. closed-source
+    /// distributions, or non-H# producers).
+    Hlib { name: String, version: Option<String>, alias: Option<String> },
     /// use "mod -> name" — deprecated, use `mod name` syntax
     #[allow(deprecated)]
     ModFile { path: String, alias: Option<String> },
