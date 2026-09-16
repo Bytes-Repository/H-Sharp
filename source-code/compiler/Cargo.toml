@@ -15,6 +15,7 @@ serde_json = "=1.0.108"
 colored    = "=2.0.4"
 hsharp-parser = { path = "../parser" }
 hsharp-typecheck = { path = "../typecheck" }
+hsharp-hlib = { path = "../hlib" }
 
 # LLVM 21 backend (merged from the former hsharp-llvm-compiler crate).
 inkwell = { version = "0.8.0", features = ["llvm21-1"] }
