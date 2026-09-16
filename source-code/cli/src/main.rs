@@ -11,6 +11,8 @@ mod repl;
 mod fmt;
 mod lsp_cmd;
 mod ffi_header;
+mod hlib_export;
+mod hlib_cmd;
 
 #[derive(Parser)]
 #[command(
@@ -146,6 +148,88 @@ pub enum Command {
         #[arg(short, long, default_value = "c")]
         lang: String,
     },
+
+    /// Build, inspect, verify and sign `.hlib` (HackerOS Lib) archives —
+    /// H#'s native library format, natively readable by Hacker Lang and
+    /// HackerScript too. See /HLIB_FORMAT.md at the repo root.
+    #[command(subcommand)]
+    Lib(LibCommand),
+}
+
+#[derive(Subcommand)]
+pub enum LibCommand {
+    /// Compile a H# source file to a shared object and package it, its
+    /// interface header, and (for any generic/macro export) its AST,
+    /// into a single `.hlib` archive.
+    ///
+    /// Examples:
+    ///   h# lib build src/mylib.h# -o mylib.hlib
+    ///   h# lib build src/mylib.h# -o mylib.hlib --sign keys/publisher.key
+    Build {
+        #[arg(help = "H# source file to package (e.g. src/mylib.h#)")]
+        file: std::path::PathBuf,
+
+        /// Output .hlib path (default: build/<stem>.hlib)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Library version string embedded in manifest.json (default: 0.1.0)
+        #[arg(long, default_value = "0.1.0")]
+        lib_version: String,
+
+        /// Cross-compilation target for the embedded .so (default: host)
+        #[arg(short, long)]
+        target: Option<String>,
+
+        /// Path to a hex-encoded Ed25519 signing key (see `h# lib keygen`).
+        /// Unsigned if omitted.
+        #[arg(long)]
+        sign: Option<std::path::PathBuf>,
+
+        /// Enable LLVM O3 + native CPU codegen for the embedded .so
+        #[arg(long)]
+        release: bool,
+    },
+
+    /// Print a `.hlib` archive's manifest and entry listing without
+    /// verifying checksums or signature (fast — just parses `manifest.json`).
+    Inspect {
+        #[arg(help = ".hlib file to inspect")]
+        file: std::path::PathBuf,
+    },
+
+    /// Verify a `.hlib` archive's internal SHA-256 checksums, and
+    /// optionally its Ed25519 signature against a known public key.
+    Verify {
+        #[arg(help = ".hlib file to verify")]
+        file: std::path::PathBuf,
+
+        /// Lowercase-hex Ed25519 public key to verify the signature
+        /// against. If omitted, only checksums are verified.
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+
+    /// Generate a fresh Ed25519 keypair for signing `.hlib` archives.
+    /// Prints the public key; writes the secret key to `--out` (hex, 0600).
+    Keygen {
+        /// Where to write the secret signing key (hex-encoded)
+        #[arg(short, long, default_value = "hlib_signing.key")]
+        out: std::path::PathBuf,
+    },
+
+    /// Extract a `.hlib`'s native artifacts to `--into`, and generate a
+    /// ready-to-`mod`-include `.h#` stub declaring an `extern` block for
+    /// every non-generic export in its header — so consuming a `.hlib`
+    /// from H# is just `mod <name>_hlib_bind;` once this has run.
+    Bind {
+        #[arg(help = ".hlib file to bind")]
+        file: std::path::PathBuf,
+
+        /// Directory to extract native artifacts and write the stub into
+        #[arg(short, long, default_value = "hlibs")]
+        into: std::path::PathBuf,
+    },
 }
 
 fn main() {
@@ -176,6 +260,7 @@ fn main() {
         Command::Repl => repl::run(),
         Command::Fmt { files, check } => fmt::run(files, check),
         Command::Lsp => lsp_cmd::run(),
+        Command::Lib(lib_cmd) => hlib_cmd::run(lib_cmd),
     }
 }
 
