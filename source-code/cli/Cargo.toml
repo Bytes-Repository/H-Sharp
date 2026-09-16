@@ -27,6 +27,7 @@ hsharp-interpreter = { path = "../interpreter" }
 # `h# lsp`), not as its own `hsharp-lsp` executable — see lsp/Cargo.toml
 # and cli/src/lsp_cmd.rs.
 hsharp-lsp         = { path = "../lsp" }
+hsharp-hlib        = { path = "../hlib" }
 
 [profile.release]
 opt-level     = 3
